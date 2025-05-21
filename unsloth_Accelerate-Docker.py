@@ -13,12 +13,17 @@ def _glob_override(self, pattern, *args, **kwargs):
     if pattern.startswith("file://"):
         return glob.glob(pattern[len("file://"):])
     # absolute paths on disk (e.g. "/app/models/Qwen3-32B/*.json")
-    if os.path.isabs(pattern):
-        return glob.glob(pattern)
+    # Also handle relative paths starting with './' or '../' implicitly
+    # by letting glob handle them relative to current PWD
+    if os.path.isabs(pattern) or pattern.startswith('./') or pattern.startswith('../') or '/' in pattern:
+         # Add a check for explicit local paths that might not be absolute but are intended as such
+         if os.path.exists(pattern) or '*' in pattern or '?' in pattern or '[' in pattern:
+             return glob.glob(pattern)
     # otherwise, fall back to HF’s original behavior
     return _orig_glob(self, pattern, *args, **kwargs)
 
 HfFileSystem.glob = _glob_override
+print("[PID {}] Patched HfFileSystem.glob for local paths.".format(os.getpid()), flush=True)
 
 # --- Critical Environment Variables (set BEFORE torch import) ---
 os.environ["TORCH_DISTRIBUTED_USE_DTENSOR"] = "0"
@@ -46,8 +51,8 @@ print(f"[PID {os.getpid()}] CUDA_VISIBLE_DEVICES (from env): {os.environ.get('CU
 print(f"[PID {os.getpid()}] ACCELERATE_USE_TP: {os.environ.get('ACCELERATE_USE_TP')}", flush=True)
 # RANK, LOCAL_RANK etc are set by accelerate launcher
 LAUNCHER_RANK = os.environ.get('RANK', 'N/A_LAUNCHER_RANK')
-LAUNCHER_LOCAL_RANK = os.environ.get('LOCAL_RANK', 'N/A_LAUNCHER_LOCAL_RANK')
-LAUNCHER_WORLD_SIZE = os.environ.get('WORLD_SIZE', 'N/A_LAUNCHER_WORLD_SIZE')
+LAUNCHER_LOCAL_RANK = os.environ.get('LOCAL_RANK', 'N/A_LOCAL_RANK')
+LAUNCHER_WORLD_SIZE = os.environ.get('WORLD_SIZE', 'N/A_WORLD_SIZE')
 print(f"[PID {os.getpid()}] Launcher Env: RANK={LAUNCHER_RANK}, LOCAL_RANK={LAUNCHER_LOCAL_RANK}, WORLD_SIZE={LAUNCHER_WORLD_SIZE}", flush=True)
 
 # --- Import torch and apply aggressive DTensor patch ---
@@ -62,7 +67,7 @@ if torch.cuda.is_available():
         # Or just 0 if CUDA_VISIBLE_DEVICES was e.g. "2" for a specific process.
         # This depends on how accelerate sets CUDA_VISIBLE_DEVICES for each process.
         # Typically, each process sees its assigned GPU as device 0.
-        if LAUNCHER_LOCAL_RANK != 'N/A_LAUNCHER_LOCAL_RANK' and int(LAUNCHER_LOCAL_RANK) < torch.cuda.device_count():
+        if LAUNCHER_LOCAL_RANK != 'N/A_LOCAL_RANK' and int(LAUNCHER_LOCAL_RANK) < torch.cuda.device_count():
             # This assumes accelerate makes each process see its assigned GPU as cuda:0
             # Let's verify this understanding
             print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Current CUDA device (by torch.cuda.current_device()): {torch.cuda.current_device()}", flush=True)
@@ -78,7 +83,7 @@ if torch.cuda.is_available():
 try:
     from torch.distributed.tensor import DTensor
     if hasattr(DTensor, "_op_dispatcher") and \
-       hasattr(DTensor._op_dispatcher, "sharding_propagator") and \
+       hasattr(DTensor._op_dispatcher.sharding_propagator) and \
        hasattr(DTensor._op_dispatcher.sharding_propagator, "propagate"):
 
         original_propagate = DTensor._op_dispatcher.sharding_propagator.propagate
@@ -142,19 +147,10 @@ def load_model(current_accelerator):
         "load_in_4bit": LOAD_IN_4BIT,
         "attn_implementation": "flash_attention_2",
         "device_map": device_map_config,
-        # Potentially add a dtype argument if Unsloth expects it for 4-bit,
-        # e.g., dtype=torch.bfloat16, but usually load_in_4bit handles this.
         # For Unsloth, 'dtype=torch.bfloat16' usually works well with load_in_4bit=True.
-        "dtype" : torch.bfloat16, # <--- ADD THIS
+        "dtype" : torch.bfloat16,
     }
 
-    # REMOVE or COMMENT OUT this block:
-    # if LOAD_IN_4BIT:
-    #     model_kwargs.update({
-    #         "bnb_4bit_compute_dtype": torch.bfloat16, # This is often implied by dtype=torch.bfloat16
-    #         "bnb_4bit_use_double_quant": False,
-    #         "bnb_4bit_quant_type": "nf4",
-    #     })
     print(f"[PID {pid}, Rank {rank_idx}] model_kwargs: {model_kwargs}", flush=True)
 
 
@@ -208,7 +204,8 @@ def load_and_split_dataset(current_accelerator):
         # or if it involves downloads. load_dataset is generally safe.
         # with current_accelerator.main_process_first(): # Example if download/caching is an issue
         #     ds = load_dataset("json", data_files={"train": LOCAL_JSONL})["train"]
-        ds = load_dataset("json", data_files={"train": LOCAL_JSONL}, trust_remote_code=True)["train"] # Added trust_remote_code
+        # Use file:// scheme to hint HfFileSystem patch about local path
+        ds = load_dataset("json", data_files={"train": f"file://{LOCAL_JSONL}"}, trust_remote_code=True)["train"]
         splits = ds.train_test_split(test_size=TEST_SPLIT_RATIO, seed=42)
         print(f"[PID {pid}, Rank {rank_idx}] load_and_split_dataset successful.", flush=True)
         return splits["train"], splits["test"]
@@ -266,10 +263,10 @@ def main():
     # Consider dataset_num_proc = 0 or 1 initially.
     DATASET_MAP_NUM_PROC = 1 # Reduced for debugging
     print(f"[PID {pid}, Rank {rank_idx}] Passing through train_ds text as-is (num_proc={DATASET_MAP_NUM_PROC})...", flush=True)
-    train_ds = train_ds.map(lambda ex: {"text": ex["text"]}, num_proc=DATASET_MAP_NUM_PROC)
+    train_ds = train_ds.map(lambda ex: {"text": ex["text"]}, num_proc=DATASET_MAP_NUM_PROC, remove_columns=[col for col in train_ds.features if col != 'text'])
 
     print(f"[PID {pid}, Rank {rank_idx}] Passing through val_ds text as-is (batched=True)...", flush=True)
-    val_ds = val_ds.map(lambda batch: {"text": batch["text"]}, batched=True, num_proc=DATASET_MAP_NUM_PROC, remove_columns=list(val_ds_raw.features))
+    val_ds = val_ds.map(lambda batch: {"text": batch["text"]}, batched=True, num_proc=DATASET_MAP_NUM_PROC, remove_columns=[col for col in val_ds.features if col != 'text'])
 
     print(f"[PID {pid}, Rank {rank_idx}] Datasets processed.", flush=True)
 
@@ -309,17 +306,22 @@ def main():
     )
     print(f"[PID {pid}, Rank {rank_idx}] SFTTrainer initialized. Model is on: {trainer.model.device}", flush=True)
 
+    # Model might be DDP wrapped by SFTTrainer's __init__ (via accelerator.prepare)
+    # Access config on unwrapped model only for main process check
     if accelerator.is_main_process:
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Pre-train check for model.config.use_cache.", flush=True)
-        # Model might be DDP wrapped by SFTTrainer's __init__ (via accelerator.prepare)
-        # Access config on unwrapped model
         unwrapped_model_for_config = accelerator.unwrap_model(trainer.model)
         if hasattr(unwrapped_model_for_config, "config") and getattr(unwrapped_model_for_config.config, "use_cache", False):
             print(f"✅ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing model.config.use_cache = False on unwrapped model.", flush=True)
             unwrapped_model_for_config.config.use_cache = False
-    
-    accelerator.wait_for_everyone() # Ensure all processes sync before training
+            # Apply to the wrapped model as well if needed, although trainer should handle this
+            # if hasattr(trainer.model, "config"):
+            #     trainer.model.config.use_cache = False # This might not work on DDP object
+
+    # Wait for all processes to complete initialization and configuration before starting training
+    accelerator.wait_for_everyone()
     print(f"[PID {pid}, Rank {rank_idx}] All processes ready. Calling trainer.train()...", flush=True)
+
     try:
         metrics = trainer.train()
         print(f"[PID {pid}, Rank {rank_idx}] trainer.train() completed.", flush=True)
@@ -328,85 +330,110 @@ def main():
         import traceback
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
-        # It's important that the failing process exits with an error code
-        # Accelerate might handle this if the exception propagates, but explicit exit can be safer.
         sys.exit(1) # Exit the failing process
 
-    accelerator.wait_for_everyone() # Sync before saving
+    # --- Critical: Wait for all processes to finish training BEFORE main process starts saving ---
+    # The error occurred here previously because Rank 0 started saving while others were waiting.
+    accelerator.wait_for_everyone()
+    print(f"[PID {pid}, Rank {rank_idx}] All processes finished training and synchronized.", flush=True)
+
+    # --- Saving logic moved AFTER the final barrier ---
     if accelerator.is_main_process:
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Training finished. Saving artifacts...", flush=True)
         lora_adapter_path = os.path.join(OUTPUT_ROOT, "lora_adapters_final")
-        
-        # --- Start of more aggressive VRAM clearing ---
+        merged_model_16bit_path = os.path.join(OUTPUT_ROOT, "merged_model_16bit")
+        full_merged_model_path = os.path.join(OUTPUT_ROOT, "full_merged_model")
+
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving LoRA adapters to {lora_adapter_path}...", flush=True)
+        # Save LoRA adapters from the trainer's model (which is the wrapped PEFT model)
+        try:
+            # PeftModel's save_pretrained can handle DDP wrapped models on the main process
+            trainer.model.save_pretrained(lora_adapter_path)
+            tokenizer.save_pretrained(lora_adapter_path)
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: LoRA adapters saved.", flush=True)
+        except Exception as e_lora_save:
+             print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Error saving LoRA adapters: {e_lora_save}", flush=True)
+             import traceback
+             traceback.print_exc(file=sys.stdout)
+             sys.stdout.flush()
+
+        # --- Start of more aggressive VRAM clearing + original saving logic ---
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Preparing for full save. Unwrapping model...", flush=True)
-        unwrapped_model_for_gguf = accelerator.unwrap_model(trainer.model)
+        unwrapped_model_for_save = accelerator.unwrap_model(trainer.model)
 
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Moving unwrapped model to CPU...", flush=True)
-        unwrapped_model_for_gguf = unwrapped_model_for_gguf.to("cpu")
+        # This is the original step that might cause issues with Unsloth's fast_dequantize
+        try:
+            unwrapped_model_for_save = unwrapped_model_for_save.to("cpu")
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Unwrapped model moved to CPU.", flush=True)
+        except Exception as e_cpu_move:
+            print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Could not move unwrapped model to CPU: {e_cpu_move}", flush=True)
+            # Decide if this should be a fatal error or just a warning. Let's print and continue to merge/save attempt.
+            import traceback
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+
 
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing GC + emptying CUDA cache...", flush=True)
-        import gc
         gc.collect()
         torch.cuda.empty_cache()
 
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Merging LoRA into base model (on CPU)...", flush=True)
         try:
-            unwrapped_model_for_gguf.merge_and_unload()
+            unwrapped_model_for_save.merge_and_unload()
             print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Merge successful.", flush=True)
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving merged 16-bit model for GGUF conversion...", flush=True)
-            unwrapped_model_for_gguf.save_pretrained_merged( os.path.join(OUTPUT_ROOT, "merged_model"), tokenizer, save_method="merged_16bit")
         except Exception as e_merge:
-            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during merge_and_unload on CPU: {e_merge}", flush=True)
+            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: ERROR during merge_and_unload on CPU: {e_merge}", flush=True)
             import traceback
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+            # Raise here as merging is critical
             raise
-        
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving LoRA adapters to {lora_adapter_path} from trainer.model (before deleting)...", flush=True)
-        # Save LoRA adapters from the original trainer.model before deleting it.
-        # PeftModel's save_pretrained can handle DDP wrapped models.
-        trainer.model.save_pretrained(lora_adapter_path)
-        tokenizer.save_pretrained(lora_adapter_path) # Tokenizer save is fine here
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: LoRA adapters saved.", flush=True)
+
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving merged 16-bit model to {merged_model_16bit_path}...", flush=True)
+        try:
+            unwrapped_model_for_save.save_pretrained_merged(merged_model_16bit_path, tokenizer, save_method="merged_16bit")
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Merged 16-bit model saved.", flush=True)
+        except Exception as e_save_16bit:
+             print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Error saving merged 16-bit model: {e_save_16bit}", flush=True)
+             import traceback
+             traceback.print_exc(file=sys.stdout)
+             sys.stdout.flush()
+
+
+        # Attempt the GGUF save using the original approach (save_pretrained after merge on CPU)
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving model to GGUF (from CPU copy) to {full_merged_model_path}...", flush=True)
+        try:
+            # This is the call that caused the 'fast_dequantize on CPU' warnings previously.
+            # Unsloth intercepts this call to perform GGUF conversion.
+            unwrapped_model_for_save.save_pretrained(full_merged_model_path)
+            tokenizer.save_pretrained(full_merged_model_path) # Save tokenizer alongside GGUF output
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Model saved to GGUF via save_pretrained.", flush=True)
+        except Exception as e_gguf:
+            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: FATAL ERROR during GGUF save via save_pretrained: {e_gguf}", flush=True)
+            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: This is the step that previously failed with 'fast_dequantize'. Check Unsloth/Torch/CUDA compatibility or try the save_pretrained_gguf method.", flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+            # Allow script to potentially finish for other ranks' outputs, but exit with error
+            sys.exit(1)
+
 
         print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Deleting trainer and model references to free VRAM...", flush=True)
-        # It's important to delete in an order that might break circular references if any.
-        # The 'model' variable used in SFTTrainer(model=model, ...) still holds a reference to the DDP model.
-        # The trainer object itself also holds references.
+        # These were already deleted conceptually earlier, but ensure they are gone.
+        # The unwrapped_model_for_save reference still exists, we should delete that too.
+        del trainer # Should be None or already deleted
+        del model   # Should be None or already deleted
+        del unwrapped_model_for_save # Delete the reference to the model on CPU
         
-        # trainer_model_device = trainer.model.device # For debug if needed
-        # model_device = model.device # For debug if needed
-
-        del trainer # This should release the DDP model held by the trainer
-        del model   # This is the 'model' variable that was passed to SFTTrainer
-                    # and holds the PEFT model which was then wrapped by Accelerator.
-        
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing garbage collection and emptying CUDA cache...", flush=True)
-        import gc
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing garbage collection and emptying CUDA cache... (Post-Save)", flush=True)
         gc.collect()
         torch.cuda.empty_cache()
-        # --- End of more aggressive VRAM clearing ---
+        # --- End of reverted saving logic ---
 
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving model to GGUF (from CPU copy)...", flush=True)
-        try:
-            # unwrapped_model_for_gguf is already on CPU
-            full_dir = os.path.join(OUTPUT_ROOT, "full_merged_model")
-            unwrapped_model_for_gguf.save_pretrained(full_dir)
-            tokenizer.save_pretrained(full_dir)
+    # No need for a final barrier after saving, as only the main process does it.
+    # The script will exit naturally.
 
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Model saved to GGUF.", flush=True)
-        except Exception as e_gguf:
-            print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Could not save GGUF: {e_gguf}", flush=True)
-            import traceback
-            traceback.print_exc(file=sys.stdout)
-            sys.stdout.flush()
-            # If this still fails with the TypeError about device_index,
-            # it means save_pretrained_gguf in Unsloth has a strict requirement
-            # for the model to be on a GPU when fast_dequantize is called,
-            # which would be a bug in its CPU-offloading logic for GGUF.
-            # If it's OOM, then the CPU model is still somehow triggering GPU allocs.
-    
-    accelerator.wait_for_everyone()
     print(f"[PID {pid}, Rank {rank_idx}] Script finished successfully for this process.", flush=True)
     return metrics if 'metrics' in locals() else None
 if __name__ == "__main__":
@@ -418,9 +445,17 @@ if __name__ == "__main__":
         # The Accelerator object in main() goes out of scope.
         # For a final status, rely on the prints from within main() and accelerator's handling of processes.
         # If we need a global "all done" from main rank:
-        temp_accelerator = Accelerator() # Create a new one just for this check
-        if temp_accelerator.is_main_process:
-            print(f"[PID {main_pid}, MainRank] __main__: Training complete. Metrics: {results}", flush=True)
+        try:
+            # Create a new one just for this check. This is safer than relying on the 'accelerator'
+            # variable from main() which might be partially de-initialized.
+            temp_accelerator_check = Accelerator()
+            if temp_accelerator_check.is_main_process:
+                print(f"[PID {main_pid}, MainRank] __main__: Training complete. Metrics: {results}", flush=True)
+            # The temp_accelerator_check will clean up when it goes out of scope
+        except Exception as e_temp_accel:
+             print(f"⚠️ [PID {main_pid}] Could not create temp accelerator for final print: {e_temp_accel}", flush=True)
+
+
     except Exception as e_main_fatal:
         print(f"🔥🔥🔥 [PID {main_pid}] FATAL ERROR in __main__ execution: {e_main_fatal}", flush=True)
         import traceback

@@ -33,4 +33,4 @@ docker run --rm -it \
 -v "$HOME/Desktop/Docker-Unsloth-Output":/app/output \
 -w /app/unsloth_run \
 rgilbreth/rtx-5xxx-unsloth-training:rtx-5xxx-unsloth-training \
-/bin/bash
+/bin/bash 
