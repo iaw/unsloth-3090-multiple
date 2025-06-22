@@ -62,7 +62,7 @@ from datasets import load_dataset
 from trl import SFTTrainer
 
 # Configuration - Adjusted for RTX 3090
-MODEL_PATH = "/app/models/Qwen3-32B"
+MODEL_PATH = "/app/models/Hermes-3-Llama-3.1-8B"
 MAX_SEQ_LENGTH = int(os.getenv("UNSLOTH_MAX_SEQ", 4096))  # Reduced from 8192
 LORA_R = 16
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
